@@ -16,7 +16,8 @@ class SequentialRandomForest(BaseEstimator, ClassifierMixin):
                  min_samples_split=2,
                  min_samples_leaf=1,
                  random_state=None,
-                 initial_class_weights=None): # <<< Added parameter
+                 initial_class_weights=None,
+                 initial_sample_weights=None): # weights passed from the previous sub-forest
         
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -24,9 +25,11 @@ class SequentialRandomForest(BaseEstimator, ClassifierMixin):
         self.min_samples_leaf = min_samples_leaf
         self.random_state = random_state
         self.initial_class_weights = initial_class_weights 
+        self.initial_sample_weights = initial_sample_weights
         self.tree_splits = tree_splits
         
         self._final_class_weights = {}              # <<< Store final weights     
+        self._final_sample_weights = None           # per-sample weights after the last tree
         
         self.node_counts = []          
 
@@ -79,45 +82,23 @@ class SequentialRandomForest(BaseEstimator, ClassifierMixin):
         self.tree_oob_errors_ = []                 # Stores  OOB errors for each tree
         
         
-         # --- Handle initial class weights ---
-        if self.initial_class_weights is not None:
-            weights_copy = self.initial_class_weights.copy()
-
-            # Add missing classes (if any)
-            missing_classes = set(self.classes_) - set(weights_copy.keys())
-            if missing_classes:
-                warnings.warn(f"Adding missing classes {missing_classes} with uniform weights.")
-                extra_weight = 1.0 / self.n_classes_
-                for cls in missing_classes:
-                    weights_copy[cls] = extra_weight
-
-            # Drop irrelevant weights (classes not in y)
-            irrelevant_classes = set(weights_copy.keys()) - set(self.classes_)
-            if irrelevant_classes:
-                warnings.warn(f"Dropping irrelevant classes {irrelevant_classes} from class weights.")
-                for cls in irrelevant_classes:
-                    del weights_copy[cls]
-
-            # Normalize to sum = 1
-            total_weight = sum(weights_copy.values())
-            if not np.isclose(total_weight, 1.0):
-                if total_weight > 0:
-                    weights_copy = {cls: w / total_weight for cls, w in weights_copy.items()}
-                else:
-                    weights_copy = {cls: 1.0 / self.n_classes_ for cls in self.classes_}
-
-            current_class_weights = weights_copy
+        # --- Initial per-sample weights (Algorithm 2, line 1) ---
+        if self.initial_sample_weights is not None:
+            # weights passed from the final tree of the previous sub-forest
+            sample_weights = np.asarray(self.initial_sample_weights, dtype=float).copy()
+            if sample_weights.shape[0] != n_samples:
+                raise ValueError("initial_sample_weights must have one weight per training sample")
         else:
-            # Default uniform weights
-            initial_weight = 1.0 / self.n_classes_
-            current_class_weights = {cls: initial_weight for cls in self.classes_}
+            sample_weights = np.full(n_samples, 1.0 / n_samples)   # w(i) = 1/N
+        sample_weights /= sample_weights.sum()
 
 
         # Tree Building ---
         for i in range(self.n_estimators):
         # for i in enumerate (self.tree_splits):
-            in_bag_indices = self._weighted_bootstrap_sample(
-                n_samples, y, current_class_weights, random_state
+            # Weighted bootstrap: each sample is drawn with probability w(i) (Algorithm 2, line 6)
+            in_bag_indices = random_state.choice(
+                n_samples, size=n_samples, replace=True, p=sample_weights
             )
             oob_indices = np.setdiff1d(np.arange(n_samples), np.unique(in_bag_indices), assume_unique=True)
 
@@ -197,33 +178,19 @@ class SequentialRandomForest(BaseEstimator, ClassifierMixin):
 
             self.tree_oob_errors_.append(tree_oob_errors_current)
 
-            # 4. Update Class Weights for the *next* iteration
-            next_class_weights_unnormalized = {}
-            total_importance = 0
-            # Check if errors could be calculated
-            if tree_oob_errors_current and not all(v == 0.5 for v in tree_oob_errors_current.values()):
-                 for cls in self.classes_:
-                     old_weight = current_class_weights.get(cls, 1.0/self.n_classes_) # Use current or default
-                     error_rate = tree_oob_errors_current.get(cls, 0.5) # Use calculated or default
-                     # Heuristic: boost weight by error
-                     importance = old_weight * (1.0 + error_rate)
-                     # Add a small epsilon to prevent weights from becoming exactly zero easily
-                     importance = max(importance, 1e-9)
-                     next_class_weights_unnormalized[cls] = importance
-                     total_importance += importance
+            # 4. Update sample weights (Algorithm 2, lines 10-16):
+            #    only OOB samples that this tree misclassified are boosted by (1 + E_t(c));
+            #    correctly classified samples keep their weight. Then normalize.
+            if len(oob_indices) > 0 and y_oob_pred is not None:
+                wrong = (y_oob_pred != y_oob)
+                for idx, cls in zip(oob_indices[wrong], y_oob[wrong]):
+                    sample_weights[idx] *= (1.0 + tree_oob_errors_current[cls])
+                sample_weights /= sample_weights.sum()
 
-                 # Normalize the weights
-                 if total_importance > 0:
-                     current_class_weights = {
-                         cls: imp / total_importance
-                         for cls, imp in next_class_weights_unnormalized.items()
-                     }
-                 # else: keep old weights if total importance is somehow zero
-            # else: keep previous weights if OOB was empty or errors were neutral
+        self._final_sample_weights = sample_weights.copy()
+        # class-level summary of the final weights (kept for logging only)
+        self._final_class_weights = {cls: float(sample_weights[y == cls].sum()) for cls in self.classes_}
 
-            # Store the current weights as the 'final' weights after this iteration
-            self._final_class_weights = current_class_weights.copy()
-                          
         self.is_fitted_ = True
         return self
 
@@ -235,6 +202,11 @@ class SequentialRandomForest(BaseEstimator, ClassifierMixin):
              # Fallback if fitting didn't complete properly
              return {cls: 1.0 / self.n_classes_ for cls in self.classes_}
         return self._final_class_weights
+
+    def get_final_sample_weights(self):
+        """Returns the per-sample weights after the last tree (passed to the next sub-forest)."""
+        check_is_fitted(self)
+        return self._final_sample_weights
 
     def predict_proba(self, X):
         """Predict class probabilities for X using weighted voting."""
@@ -288,6 +260,4 @@ class SequentialRandomForest(BaseEstimator, ClassifierMixin):
         """Predict class for X."""
         proba = self.predict_proba(X)
         return self.classes_[np.argmax(proba, axis=1)] 
-    # I ADD proba only for baseline version, Else remove the proba !!!!!
-
-
+    # I ADD proba only for baseline version, remove the proba !!!!!
