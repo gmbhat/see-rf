@@ -6,16 +6,20 @@ from ECE import ECE_computation , calculate_confidence_max_prob
 import concurrent.futures , time
 
 def _predict_for_tree(args):
-    tree_batch, X_test_temp, n_samples, classes_ = args
+    # Weighted voting (Eq. 4 and 5): a tree that predicts class c adds L(c) = 1 - E(c),
+    # where E(c) is that tree's OOB error for class c.
+    tree_batch, error_batch, X_test_temp, n_samples, classes_ = args
     scores_per_batch = np.zeros((n_samples, len(classes_)))
     
-    for tree in tree_batch:
+    for tree, tree_errors in zip(tree_batch, error_batch):
+        if tree is None:
+            continue
         predictions = tree.predict(X_test_temp)
         for sample_idx in range(n_samples):
             predicted_class = predictions[sample_idx]
             if predicted_class in classes_:
                 class_idx = np.where(classes_ == predicted_class)[0][0]
-                scores_per_batch[sample_idx, class_idx] += 1   
+                scores_per_batch[sample_idx, class_idx] += 1.0 - tree_errors.get(predicted_class, 0.5)
     return scores_per_batch
 
 
@@ -43,7 +47,9 @@ class RunInference:
     
     def predict_proba(self):
 
-        self.classes_ = unique_labels(self.y_test)
+        # self.classes_ = unique_labels(self.y_test)
+        
+        self.classes_ = self.models[0]['model'].classes_
         self.n_classes_ = len(self.classes_)
         n_features_total = self.X_test.shape[1]
         self.all_scores = np.zeros((self.n_samples, self.n_classes_))
@@ -51,7 +57,7 @@ class RunInference:
         self.all_predict = []
         self.connected_prediction = []
         self.list_of_Prob = []
-        
+        self.total_trees_so_far = 0
         BATCH_SIZE = 10
         for j in range(len(self.models)):
         
@@ -82,10 +88,10 @@ class RunInference:
             
             # do the prediction parallel  --> new version
             # Divide the trees into batches
-            tree_batches = [self.trees_[i:i + BATCH_SIZE] for i in range(0, len(self.trees_), BATCH_SIZE)]
-            
-            # Prepare arguments for each batch
-            list_args = [(batch, X_test_temp, self.n_samples, self.classes_) for batch in tree_batches]
+            tree_errors_ = srf.tree_oob_errors_   # OOB error per class for each tree (from training)
+            list_args = [(self.trees_[i:i + BATCH_SIZE], tree_errors_[i:i + BATCH_SIZE],
+                          X_test_temp, self.n_samples, self.classes_)
+                         for i in range(0, len(self.trees_), BATCH_SIZE)]
 
             # tree_scores_list = Parallel(n_jobs=-1, verbose=10)(delayed(_predict_for_tree)(tree, X_test_temp, self.n_samples, self.classes_) for tree in self.trees_ )
             
@@ -105,16 +111,23 @@ class RunInference:
 
             self.all_scores += scores
              
-            self.connected_prediction.append(np.argmax(self.all_scores , axis=1))
+            # Cumulative prediction: votes of all sub-forests reached so far (paper: "combining
+            # predictions of all available sub-forests"). Map argmax position -> class label.
+            cumulative_prediction = self.classes_[np.argmax(self.all_scores , axis=1)]
+            self.connected_prediction.append(cumulative_prediction)
             
-            denominator = len(self.trees_) * (j + 1)
-            
-            proba = self.all_scores / denominator
+            # P(c|x): normalize the weighted scores so each row sums to 1 (Eq. 5)
+            self.total_trees_so_far += len(self.trees_)
+            row_sums = self.all_scores.sum(axis=1, keepdims=True)
+            proba = np.divide(self.all_scores, row_sums,
+                              out=np.full_like(self.all_scores, 1.0 / self.n_classes_),
+                              where=row_sums > 1e-12)
             self.list_of_Prob.append(proba)
             self.srf_entropy =  self.entropy(proba)
             
             self.all_entropy.append( self.srf_entropy)
-            self.all_predict.append(np.argmax(scores , axis=1))
+            # The prediction at exit j uses the same cumulative votes as the entropy at exit j
+            self.all_predict.append(cumulative_prediction)
         
         return self.all_entropy , self.all_predict  
     
@@ -554,4 +567,3 @@ class RunInference:
     #     print("="*30)
         
     #     return self.indices_in, self.indices_out, all_keys_inference_metrics
-
