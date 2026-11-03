@@ -61,8 +61,8 @@ def run_staged_srf(X_train, y_train, X_VAL, y_VAL, config_index,
             n_estimators= number_of_tress_per_forest[i],
             max_depth = overall_max_depth,
             random_state = random_state,
-            tree_splits = tree_splits
-            # initial_class_weights=final_weights
+            tree_splits = tree_splits,
+            initial_sample_weights=final_weights   # None for the first sub-forest -> 1/N
         )
      
         # Train sRF for this stage
@@ -77,8 +77,8 @@ def run_staged_srf(X_train, y_train, X_VAL, y_VAL, config_index,
         print(f"  Stage {stage_num} Test Accuracy: {acc_stage:.4f}")
         
         # Get final weights for the next stage
-        # final_weights = srf_stage.get_final_class_weights()
-        # if logger: logger.info(f"  Final class weights for next stage: { {k: round(v, 3) for k, v in final_weights.items()} }")
+        final_weights = srf_stage.get_final_sample_weights()
+        if logger: logger.info(f"  Class share of final sample weights: { {k: round(v, 3) for k, v in srf_stage.get_final_class_weights().items()} }")
 
         models_info.append({
             'model': srf_stage,
@@ -323,8 +323,3 @@ def Run_orchestrator(dataset_name, max_depth, overall_n_estimators , split_point
     if logger: logger.info(f"============================================================ \n\n")
 
     return results_to_return
-
-
-        
-        
-        
